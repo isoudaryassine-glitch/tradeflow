@@ -217,8 +217,36 @@ const today=()=>new Date().toISOString().slice(0,10);
 const uid=()=>Math.random().toString(36).slice(2,9).toUpperCase();
 const clsx=(...args)=>args.filter(Boolean).join(' ');
 
-// ─── Storage ──────────────────────────────────────────────────────────────────
-const STORE_KEY='tradeflow_maroc_v2';
+// ─── Supabase Config ──────────────────────────────────────────────────────────
+const SUPABASE_URL='https://vhgwklswupvfvaoqegcq.supabase.co';
+const SUPABASE_KEY='sb_publishable_fbWXGju0BcFslufDx3HHrg_057TiWKM';
+const SB_TABLE='tradeflow_store';
+const SB_ROW_ID=1;
+
+async function sbGet(){
+  try{
+    const r=await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}?id=eq.${SB_ROW_ID}&select=data`,{
+      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY}
+    });
+    const rows=await r.json();
+    if(rows&&rows.length>0&&rows[0].data)return rows[0].data;
+    return null;
+  }catch(e){console.error('SB get error',e);return null;}
+}
+
+async function sbSet(data){
+  try{
+    // Upsert: insert or update row id=1
+    await fetch(`${SUPABASE_URL}/rest/v1/${SB_TABLE}`,{
+      method:'POST',
+      headers:{'apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,
+        'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'},
+      body:JSON.stringify({id:SB_ROW_ID,data})
+    });
+  }catch(e){console.error('SB set error',e);}
+}
+
+// ─── Default Data ──────────────────────────────────────────────────────────────
 const defaultData={
   auth:{loggedIn:false},
   products:[],
@@ -241,7 +269,7 @@ const defaultData={
     lowStockThreshold:5,
     tvaRate:20,
     currency:'MAD',
-    adminPassword:'21224A5',
+    adminPassword:'admin123',
     autoLogoutMinutes:60,
     createdAt:'2025-01-01',
   },
@@ -251,27 +279,47 @@ const defaultData={
   codOrders:[],
 };
 
-function useStore(){
-  const [data,setData]=useState(()=>{
-    try{
-      const s=localStorage.getItem(STORE_KEY);
-      if(!s)return defaultData;
-      const saved=JSON.parse(s);
-      // Merge: add any new top-level keys from defaultData that are missing in saved
-      const merged={...defaultData,...saved};
-      Object.keys(defaultData).forEach(k=>{
-        if(merged[k]===undefined||merged[k]===null)merged[k]=defaultData[k];
-        // If saved key is an empty array but default has sample data for new keys, keep saved (user may have cleared it)
-        // But if key is completely missing from saved, use defaultData
-        if(!(k in saved))merged[k]=defaultData[k];
-      });
-      return merged;
-    }catch{return defaultData;}
+function mergeWithDefaults(saved){
+  const merged={...defaultData,...saved};
+  Object.keys(defaultData).forEach(k=>{
+    if(merged[k]===undefined||merged[k]===null)merged[k]=defaultData[k];
+    if(!(k in saved))merged[k]=defaultData[k];
   });
-  const update=useCallback((fn)=>{
-    setData(prev=>{const next=fn(prev);localStorage.setItem(STORE_KEY,JSON.stringify(next));return next;});
+  // Always reset auth to logged out on fresh load
+  merged.auth={loggedIn:false};
+  return merged;
+}
+
+function useStore(){
+  const[data,setData]=useState(defaultData);
+  const[loading,setLoading]=useState(true);
+  const[syncing,setSyncing]=useState(false);
+  const saveTimer=useRef(null);
+
+  // Load from Supabase on mount
+  useEffect(()=>{
+    sbGet().then(saved=>{
+      if(saved){
+        setData(mergeWithDefaults(saved));
+      }
+      setLoading(false);
+    });
   },[]);
-  return{data,update};
+
+  const update=useCallback((fn)=>{
+    setData(prev=>{
+      const next=fn(prev);
+      // Debounced save to Supabase (wait 800ms after last change)
+      clearTimeout(saveTimer.current);
+      setSyncing(true);
+      saveTimer.current=setTimeout(()=>{
+        sbSet(next).then(()=>setSyncing(false));
+      },800);
+      return next;
+    });
+  },[]);
+
+  return{data,update,loading,syncing};
 }
 
 // ─── Icons (inline SVG) ───────────────────────────────────────────────────────
@@ -4139,7 +4187,14 @@ function MonthlyReport({data,calcs,onClose}){
 
 // ─── App Root ─────────────────────────────────────────────────────────────────
 function App(){
-  const{data,update}=useStore();
+  const{data,update,loading,syncing}=useStore();
+  if(loading)return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:'#0F172A',flexDirection:'column',gap:16}}>
+      <div style={{width:48,height:48,border:'4px solid #334155',borderTopColor:'#0D9488',borderRadius:'50%',animation:'spin 0.8s linear infinite'}}/>
+      <div style={{color:'#94A3B8',fontFamily:'Outfit',fontSize:15}}>Chargement des données...</div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg);}}`}</style>
+    </div>
+  );
   const[page,setPage]=useState('dashboard');
   const[sidebarOpen,setSidebarOpen]=useState(false);
   const[showReport,setShowReport]=useState(false);
@@ -4171,7 +4226,12 @@ function App(){
             </button>
             <BackupRestore data={data}/>
             <span style={{fontSize:11,color:'#94A3B8',paddingLeft:6,borderLeft:'1px solid #E2E8F0'}}>
-              {new Date().toLocaleDateString('fr-MA',{day:'numeric',month:'short',year:'numeric'})}
+              {syncing&&<span style={{fontSize:11,color:'#0D9488',display:'flex',alignItems:'center',gap:4}}>
+                <span style={{width:6,height:6,borderRadius:'50%',background:'#0D9488',display:'inline-block',animation:'pulse 1s ease-in-out infinite'}}/>
+                Sauvegarde...
+              </span>}
+              {!syncing&&<span style={{fontSize:11,color:'#94A3B8'}}>✓ Synchronisé</span>}
+              <span style={{fontSize:11,color:'#94A3B8',paddingLeft:6,borderLeft:'1px solid #E2E8F0'}}>{new Date().toLocaleDateString('fr-MA',{day:'numeric',month:'short',year:'numeric'})}</span>
             </span>
           </div>
         </div>
@@ -4192,7 +4252,7 @@ function App(){
         </div>
       </div>
       {showReport&&<MonthlyReport data={data} calcs={calcs} onClose={()=>setShowReport(false)}/>}
-      <style>{`@media(max-width:768px){.menu-btn{display:flex!important;}}`}</style>
+      <style>{`@media(max-width:768px){.menu-btn{display:flex!important;}}@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}`}</style>
     </div>
   );
 }
